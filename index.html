@@ -10,6 +10,7 @@
 <meta name="theme-color" content="#e9ebe6">
 <title>Workout Tracker</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 /* ==========================================================================
    Modernist design system — tokens + components, adapted from the
@@ -374,6 +375,23 @@ canvas { max-height: 200px; }
 
 <script>
 /* =========================================================================
+   SUPABASE SETUP — paste your own values here (Project Settings -> API)
+   ========================================================================= */
+const SUPABASE_URL = 'YOUR_SUPABASE_URL';
+const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY';
+const sb = (SUPABASE_URL.startsWith('YOUR_') || SUPABASE_ANON_KEY.startsWith('YOUR_'))
+  ? null
+  : window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+function showConfigWarningIfNeeded() {
+  if (sb) return;
+  const banner = document.createElement('div');
+  banner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#061414;color:#bcff00;font-size:12px;padding:10px 16px;text-align:center;z-index:999;font-family:sans-serif;';
+  banner.textContent = 'Supabase not configured yet — paste your Project URL and anon key into the SUPABASE_URL / SUPABASE_ANON_KEY constants near the top of the <script> tag.';
+  document.body.prepend(banner);
+}
+
+/* =========================================================================
    EXERCISE LIBRARY  (unchanged / previously verified)
    ========================================================================= */
 const EXERCISES = [
@@ -427,18 +445,61 @@ const SPLIT_ORDER = ['Push','Pull','Legs'];
 const WEEKLY_GOAL = 3;
 
 /* =========================================================================
-   STORAGE
+   DATA LAYER — Supabase-backed (falls back to an in-memory stub if not
+   configured yet, so the UI still renders instead of throwing).
    ========================================================================= */
-const STORE_KEYS = { logs:'wa2_logs', measures:'wa2_measures', equipment:'wa2_equipment' };
-function loadLogs() { return JSON.parse(localStorage.getItem(STORE_KEYS.logs) || '[]'); }
-function saveLogs(logs) { localStorage.setItem(STORE_KEYS.logs, JSON.stringify(logs)); }
-function loadMeasures() { return JSON.parse(localStorage.getItem(STORE_KEYS.measures) || '[]'); }
-function saveMeasures(m) { localStorage.setItem(STORE_KEYS.measures, JSON.stringify(m)); }
-function loadEquipment() { const raw = localStorage.getItem(STORE_KEYS.equipment); return raw ? JSON.parse(raw) : ['bodyweight']; }
-function saveEquipment(eq) { localStorage.setItem(STORE_KEYS.equipment, JSON.stringify(eq)); }
+async function loadLogs() {
+  if (!sb) return [];
+  const { data, error } = await sb.from('workouts').select('*').order('date', { ascending: true });
+  if (error) { console.error('[loadLogs]', error); return []; }
+  return data.map(r => ({ id: r.id, date: r.date, split: r.split, exercises: r.exercises || [], feel: r.feel || '', soreMuscles: r.sore_muscles || [], durationMin: r.duration_min }));
+}
+async function addLog(log) {
+  if (!sb) return;
+  const { error } = await sb.from('workouts').insert({
+    date: log.date, split: log.split, exercises: log.exercises, feel: log.feel,
+    sore_muscles: log.soreMuscles, duration_min: log.durationMin,
+  });
+  if (error) console.error('[addLog]', error);
+}
+async function deleteLog(id) {
+  if (!sb) return;
+  const { error } = await sb.from('workouts').delete().eq('id', id);
+  if (error) console.error('[deleteLog]', error);
+}
+
+async function loadMeasures() {
+  if (!sb) return [];
+  const { data, error } = await sb.from('measurements').select('*').order('date', { ascending: true });
+  if (error) { console.error('[loadMeasures]', error); return []; }
+  return data.map(r => ({ id: r.id, date: r.date, weight: r.weight, bodyFat: r.body_fat }));
+}
+async function addMeasure(m) {
+  if (!sb) return;
+  const { error } = await sb.from('measurements').insert({ date: m.date, weight: m.weight, body_fat: m.bodyFat });
+  if (error) console.error('[addMeasure]', error);
+}
+async function deleteMeasure(id) {
+  if (!sb) return;
+  const { error } = await sb.from('measurements').delete().eq('id', id);
+  if (error) console.error('[deleteMeasure]', error);
+}
+
+async function loadEquipment() {
+  if (!sb) return ['bodyweight'];
+  const { data, error } = await sb.from('settings').select('value').eq('id', 'equipment').maybeSingle();
+  if (error || !data) return ['bodyweight'];
+  return data.value;
+}
+async function saveEquipment(eq) {
+  if (!sb) return;
+  const { error } = await sb.from('settings').upsert({ id: 'equipment', value: eq });
+  if (error) console.error('[saveEquipment]', error);
+}
 
 /* =========================================================================
-   RECOMMENDATION ENGINE (unit-tested with sample data)
+   RECOMMENDATION ENGINE — pure functions, unit-tested, unchanged from
+   earlier builds. Operates on an already-loaded `logs` array.
    ========================================================================= */
 function nextSplit(logs) {
   const lifts = logs.filter(l => SPLIT_ORDER.includes(l.split));
@@ -499,7 +560,7 @@ function startOfRange(daysAgo) { const d = new Date(); d.setDate(d.getDate() - d
    STATE
    ========================================================================= */
 let selectedSplit = 'auto';
-let workoutDraft = null; // { split, durationMin, exercises:[{id,name,muscle,tier,sets:[{weight,reps,done}]}], currentExIdx, currentSetIdx }
+let workoutDraft = null;
 let restTimerHandle = null;
 
 /* =========================================================================
@@ -509,32 +570,32 @@ const SCREEN_LABELS = {
   dashboard: 'Home', choose: 'Choose workout', quicklog: 'Quick log', overview: 'Overview',
   addexercise: 'Add exercise', active: 'Active workout', done: '', trends: 'Trends', body: 'Body',
 };
-function showScreen(name) {
+async function showScreen(name) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById('screen-' + name).classList.add('active');
   document.getElementById('screenLabel').textContent = SCREEN_LABELS[name] || '';
   const tabMap = { dashboard:'dashboard', choose:'workout', quicklog:'workout', overview:'workout', addexercise:'workout', active:'workout', done:'workout', trends:'trends', body:'body' };
   document.querySelectorAll('#tabbar button').forEach(b => b.classList.toggle('active', b.dataset.tab === tabMap[name]));
-  if (name === 'dashboard') renderDashboard();
-  if (name === 'choose') renderChoose();
-  if (name === 'trends') renderTrends();
-  if (name === 'body') renderBody();
+  if (name === 'dashboard') await renderDashboard();
+  if (name === 'choose') await renderChoose();
+  if (name === 'trends') await renderTrends();
+  if (name === 'body') await renderBody();
 }
 document.querySelectorAll('#tabbar button').forEach(btn => {
-  btn.addEventListener('click', () => {
+  btn.addEventListener('click', async () => {
     const tab = btn.dataset.tab;
-    if (tab === 'dashboard') showScreen('dashboard');
-    else if (tab === 'workout') showScreen(workoutDraft ? 'overview' : 'choose');
-    else if (tab === 'trends') showScreen('trends');
-    else if (tab === 'body') showScreen('body');
+    if (tab === 'dashboard') await showScreen('dashboard');
+    else if (tab === 'workout') await showScreen(workoutDraft ? 'overview' : 'choose');
+    else if (tab === 'trends') await showScreen('trends');
+    else if (tab === 'body') await showScreen('body');
   });
 });
 
 /* =========================================================================
    DASHBOARD
    ========================================================================= */
-function renderDashboard() {
-  const logs = loadLogs();
+async function renderDashboard() {
+  const logs = await loadLogs();
   const hour = new Date().getHours();
   document.getElementById('dashGreeting').textContent = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
 
@@ -565,7 +626,7 @@ function renderDashboard() {
     document.getElementById('dashLastNote').textContent = 'Head to Workout to get your first recommendation.';
   }
 }
-document.getElementById('btnGoToWorkout').addEventListener('click', () => showScreen(workoutDraft ? 'overview' : 'choose'));
+document.getElementById('btnGoToWorkout').addEventListener('click', async () => await showScreen(workoutDraft ? 'overview' : 'choose'));
 
 /* =========================================================================
    CHOOSE WORKOUT
@@ -576,8 +637,8 @@ document.getElementById('durationSeg').addEventListener('click', (e) => {
   document.querySelectorAll('#durationSeg .seg-opt').forEach(o => o.classList.remove('checked'));
   label.classList.add('checked');
 });
-function renderChoose() {
-  const logs = loadLogs();
+async function renderChoose() {
+  const logs = await loadLogs();
   const auto = nextSplit(logs);
   if (selectedSplit === 'auto') selectedSplit = auto;
   const row = document.getElementById('splitPickRow');
@@ -586,27 +647,27 @@ function renderChoose() {
       <div class="card-title" style="font-size:20px;">${s}</div>
       ${s === auto ? '<div class="card-meta">Recommended</div>' : ''}
     </div>`).join('');
-  row.querySelectorAll('.card').forEach(c => c.addEventListener('click', () => { selectedSplit = c.dataset.split; renderChoose(); }));
+  row.querySelectorAll('.card').forEach(c => c.addEventListener('click', async () => { selectedSplit = c.dataset.split; await renderChoose(); }));
 
-  const eq = loadEquipment();
+  const eq = await loadEquipment();
   const eqWrap = document.getElementById('equipmentTags');
   eqWrap.innerHTML = EQUIPMENT_OPTIONS.map(o => `<div class="tag ${eq.includes(o.id) ? 'active' : 'tag-neutral'}" data-eq="${o.id}">${escapeHtml(o.label)}</div>`).join('');
-  eqWrap.querySelectorAll('.tag').forEach(t => t.addEventListener('click', () => {
-    let cur = loadEquipment();
+  eqWrap.querySelectorAll('.tag').forEach(t => t.addEventListener('click', async () => {
+    let cur = await loadEquipment();
     const id = t.dataset.eq;
     if (cur.includes(id)) cur = cur.filter(x => x !== id); else cur = [...cur, id];
     if (!cur.length) cur = ['bodyweight'];
-    saveEquipment(cur);
-    renderChoose();
+    await saveEquipment(cur);
+    await renderChoose();
   }));
 
   const rec = recommendWorkout(logs, eq, selectedSplit);
   const preview = document.getElementById('choosePlanPreview');
   preview.innerHTML = rec.safetyNotes.length ? rec.safetyNotes.map(n => `<p class="card-body text-muted">⚠ ${escapeHtml(n)}</p>`).join('') : '';
 }
-document.getElementById('btnStartWorkout').addEventListener('click', () => {
-  const logs = loadLogs();
-  const eq = loadEquipment();
+document.getElementById('btnStartWorkout').addEventListener('click', async () => {
+  const logs = await loadLogs();
+  const eq = await loadEquipment();
   const rec = recommendWorkout(logs, eq, selectedSplit);
   const mins = document.querySelector('#durationSeg input:checked')?.value || '60';
   if (!rec.plan.length) { alert('No exercises match your equipment for this split — add more equipment on this screen.'); return; }
@@ -620,25 +681,24 @@ document.getElementById('btnStartWorkout').addEventListener('click', () => {
     currentExIdx: 0, currentSetIdx: 0,
   };
   renderOverview();
-  showScreen('overview');
+  await showScreen('overview');
 });
-document.getElementById('btnQuickLog').addEventListener('click', () => {
+document.getElementById('btnQuickLog').addEventListener('click', async () => {
   document.getElementById('qlActivity').value = '';
   document.getElementById('qlFeel').value = '';
-  showScreen('quicklog');
+  await showScreen('quicklog');
 });
-document.getElementById('backFromQuickLog').addEventListener('click', () => showScreen('choose'));
-document.getElementById('btnSaveQuickLog').addEventListener('click', () => {
+document.getElementById('backFromQuickLog').addEventListener('click', async () => await showScreen('choose'));
+document.getElementById('btnSaveQuickLog').addEventListener('click', async () => {
   const activity = document.getElementById('qlActivity').value.trim() || 'Other activity';
   const feel = document.getElementById('qlFeel').value.trim();
-  const logs = loadLogs();
-  logs.push({ date: new Date().toISOString().slice(0,10), split: activity, exercises: [], feel, soreMuscles: [] });
-  saveLogs(logs);
-  showScreen('dashboard');
+  await addLog({ date: new Date().toISOString().slice(0,10), split: activity, exercises: [], feel, soreMuscles: [] });
+  await showScreen('dashboard');
 });
 
 /* =========================================================================
-   OVERVIEW
+   OVERVIEW  (operates on the in-memory workoutDraft only — no DB writes
+   happen until the workout is saved on the Done screen)
    ========================================================================= */
 function renderOverview() {
   if (!workoutDraft) return;
@@ -666,36 +726,36 @@ function renderOverview() {
     renderOverview();
   }));
 }
-document.getElementById('backFromOverview').addEventListener('click', () => {
-  if (confirm('Discard this in-progress workout?')) { workoutDraft = null; showScreen('dashboard'); }
+document.getElementById('backFromOverview').addEventListener('click', async () => {
+  if (confirm('Discard this in-progress workout?')) { workoutDraft = null; await showScreen('dashboard'); }
 });
-document.getElementById('btnFinishEarly').addEventListener('click', () => finishWorkout());
-document.getElementById('btnAddExerciseFab').addEventListener('click', () => { renderAddExercise(); showScreen('addexercise'); });
-document.getElementById('backFromAddExercise').addEventListener('click', () => showScreen('overview'));
+document.getElementById('btnFinishEarly').addEventListener('click', async () => await finishWorkout());
+document.getElementById('btnAddExerciseFab').addEventListener('click', async () => { renderAddExercise(); await showScreen('addexercise'); });
+document.getElementById('backFromAddExercise').addEventListener('click', async () => await showScreen('overview'));
 function renderAddExercise() {
   const wrap = document.getElementById('addExerciseList');
   const list = EXERCISES.filter(e => e.split === workoutDraft.split);
   wrap.innerHTML = list.map(e => `<div class="exrow" style="cursor:pointer" data-id="${e.id}"><div style="flex:1"><div class="name">${escapeHtml(e.name)}</div><div class="delta">${escapeHtml(e.muscle)} · ${e.tier}</div></div></div>`).join('');
-  wrap.querySelectorAll('[data-id]').forEach(row => row.addEventListener('click', () => {
+  wrap.querySelectorAll('[data-id]').forEach(row => row.addEventListener('click', async () => {
     const ex = EXERCISES.find(e => e.id === row.dataset.id);
     workoutDraft.exercises.push({
       id: ex.id, name: ex.name, muscle: ex.muscle, tier: ex.tier, note: '', up: false,
       sets: Array.from({ length: ex.sets }, () => ({ weight: null, reps: rangeMid(ex.repsLow, ex.repsHigh), done: false })),
     });
     renderOverview();
-    showScreen('overview');
+    await showScreen('overview');
   }));
 }
 
 /* =========================================================================
-   ACTIVE WORKOUT
+   ACTIVE WORKOUT  (in-memory workoutDraft only)
    ========================================================================= */
-function openActive(idx) {
+async function openActive(idx) {
   workoutDraft.currentExIdx = idx;
   workoutDraft.currentSetIdx = workoutDraft.exercises[idx].sets.findIndex(s => !s.done);
   if (workoutDraft.currentSetIdx === -1) workoutDraft.currentSetIdx = 0;
   renderActive();
-  showScreen('active');
+  await showScreen('active');
 }
 function renderActive() {
   const ex = workoutDraft.exercises[workoutDraft.currentExIdx];
@@ -717,8 +777,8 @@ function renderActive() {
   document.getElementById('btnCompleteSet').textContent = 'Complete set';
   document.getElementById('btnCompleteSet').disabled = false;
 }
-document.getElementById('backFromActive').addEventListener('click', () => { renderOverview(); showScreen('overview'); });
-document.getElementById('btnCompleteSet').addEventListener('click', () => {
+document.getElementById('backFromActive').addEventListener('click', async () => { renderOverview(); await showScreen('overview'); });
+document.getElementById('btnCompleteSet').addEventListener('click', async () => {
   const ex = workoutDraft.exercises[workoutDraft.currentExIdx];
   const set = ex.sets[workoutDraft.currentSetIdx];
   if (set) set.done = true;
@@ -728,9 +788,9 @@ document.getElementById('btnCompleteSet').addEventListener('click', () => {
     renderActive();
     startRestCountdown(90);
   } else if (workoutDraft.currentExIdx < workoutDraft.exercises.length - 1) {
-    openActive(workoutDraft.currentExIdx + 1);
+    await openActive(workoutDraft.currentExIdx + 1);
   } else {
-    finishWorkout();
+    await finishWorkout();
   }
 });
 function startRestCountdown(seconds) {
@@ -758,9 +818,9 @@ function renderSoreChipsInto(elId) {
     t.style.color = active ? 'var(--color-accent)' : 'var(--color-text)';
   }));
 }
-function finishWorkout() {
+async function finishWorkout() {
   clearInterval(restTimerHandle);
-  const logs = loadLogs();
+  const logs = await loadLogs();
   const vol = sessionVolume({ exercises: workoutDraft.exercises });
   const recent = logs.filter(l => l.split === workoutDraft.split).slice(-4);
   const avgRecentVol = recent.length ? recent.reduce((s,l)=>s+sessionVolume(l),0) / recent.length : 0;
@@ -788,10 +848,9 @@ function finishWorkout() {
 
   document.getElementById('doneFeel').value = '';
   renderSoreChipsInto('doneSoreTags');
-  showScreen('done');
+  await showScreen('done');
 }
-document.getElementById('btnSaveDone').addEventListener('click', () => {
-  const logs = loadLogs();
+document.getElementById('btnSaveDone').addEventListener('click', async () => {
   const feel = document.getElementById('doneFeel').value.trim();
   const soreMuscles = [...document.querySelectorAll('#doneSoreTags .tag.active')].map(t => t.dataset.muscle);
   const flatExercises = workoutDraft.exercises.map(ex => ({
@@ -799,12 +858,10 @@ document.getElementById('btnSaveDone').addEventListener('click', () => {
     sets: ex.sets.length, reps: ex.sets[0] ? ex.sets[0].reps : null, weight: ex.sets[0] ? ex.sets[0].weight : null,
     struggled: ex.sets.some(s => !s.done),
   }));
-  logs.push({ date: new Date().toISOString().slice(0,10), split: workoutDraft.split, exercises: flatExercises, feel, soreMuscles, durationMin: workoutDraft.durationMin });
-  logs.sort((a,b) => a.date.localeCompare(b.date));
-  saveLogs(logs);
+  await addLog({ date: new Date().toISOString().slice(0,10), split: workoutDraft.split, exercises: flatExercises, feel, soreMuscles, durationMin: workoutDraft.durationMin });
   workoutDraft = null;
   selectedSplit = 'auto';
-  showScreen('dashboard');
+  await showScreen('dashboard');
 });
 
 /* =========================================================================
@@ -814,17 +871,15 @@ let progressChartInstance = null;
 function themeColor(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
-function populateTrendPicker() {
-  const logs = loadLogs();
+function populateTrendPicker(logs) {
   const usedIds = new Set();
   logs.forEach(l => (l.exercises||[]).forEach(e => usedIds.add(e.id)));
   const sel = document.getElementById('trendExercisePicker');
   const list = EXERCISES.filter(e => usedIds.has(e.id));
   sel.innerHTML = list.length ? list.map(e => `<option value="${e.id}">${escapeHtml(e.name)}</option>`).join('') : '<option value="">Log a workout to see progress</option>';
 }
-function renderProgressChart() {
+function renderProgressChart(logs) {
   const id = document.getElementById('trendExercisePicker').value;
-  const logs = loadLogs();
   const points = [];
   logs.forEach(l => { const e = (l.exercises||[]).find(x => x.id === id); if (e) points.push({ date: l.date, weight: Number(e.weight)||0 }); });
   const ctx = document.getElementById('progressChart');
@@ -838,12 +893,15 @@ function renderProgressChart() {
     } },
   });
 }
-document.getElementById('trendExercisePicker').addEventListener('change', renderProgressChart);
-function renderTrends() {
-  populateTrendPicker();
-  renderProgressChart();
+document.getElementById('trendExercisePicker').addEventListener('change', async () => {
+  const logs = await loadLogs();
+  renderProgressChart(logs);
+});
+async function renderTrends() {
+  const logs = await loadLogs();
+  populateTrendPicker(logs);
+  renderProgressChart(logs);
 
-  const logs = loadLogs();
   const strip = document.getElementById('weeklyGoalStrip');
   const weeks = [];
   for (let w = 7; w >= 0; w--) {
@@ -870,12 +928,12 @@ function renderTrends() {
   const histWrap = document.getElementById('historyList');
   if (!logs.length) { histWrap.innerHTML = '<div class="empty-state">No workouts logged yet.</div>'; }
   else {
-    histWrap.innerHTML = [...logs].reverse().map((l, revIdx) => {
-      const idx = logs.length - 1 - revIdx;
-      return `<div class="exrow"><div style="flex:1"><div class="name">${escapeHtml(l.date)} · ${escapeHtml(l.split)}</div><div class="delta">${(l.exercises||[]).length} exercises${l.feel ? ' · "' + escapeHtml(l.feel) + '"' : ''}</div></div><button class="del" data-hdel="${idx}">×</button></div>`;
+    histWrap.innerHTML = [...logs].reverse().map((l) => {
+      return `<div class="exrow"><div style="flex:1"><div class="name">${escapeHtml(l.date)} · ${escapeHtml(l.split)}</div><div class="delta">${(l.exercises||[]).length} exercises${l.feel ? ' · "' + escapeHtml(l.feel) + '"' : ''}</div></div><button class="del" data-hdel="${l.id}">×</button></div>`;
     }).join('');
-    histWrap.querySelectorAll('[data-hdel]').forEach(btn => btn.addEventListener('click', () => {
-      const l = loadLogs(); l.splice(Number(btn.dataset.hdel), 1); saveLogs(l); renderTrends();
+    histWrap.querySelectorAll('[data-hdel]').forEach(btn => btn.addEventListener('click', async () => {
+      await deleteLog(btn.dataset.hdel);
+      await renderTrends();
     }));
   }
 }
@@ -885,21 +943,18 @@ function renderTrends() {
    ========================================================================= */
 let measureChartInstance = null;
 document.getElementById('measureDate').valueAsDate = new Date();
-document.getElementById('btnSaveMeasure').addEventListener('click', () => {
+document.getElementById('btnSaveMeasure').addEventListener('click', async () => {
   const date = document.getElementById('measureDate').value || new Date().toISOString().slice(0,10);
   const weight = document.getElementById('measureWeight').value;
   const bf = document.getElementById('measureBF').value;
   if (!weight && !bf) { alert('Enter at least a weight or body fat %.'); return; }
-  const m = loadMeasures();
-  m.push({ date, weight: weight ? Number(weight) : null, bodyFat: bf ? Number(bf) : null });
-  m.sort((a,b) => a.date.localeCompare(b.date));
-  saveMeasures(m);
+  await addMeasure({ date, weight: weight ? Number(weight) : null, bodyFat: bf ? Number(bf) : null });
   document.getElementById('measureWeight').value = '';
   document.getElementById('measureBF').value = '';
-  renderBody();
+  await renderBody();
 });
-function renderBody() {
-  const m = loadMeasures();
+async function renderBody() {
+  const m = await loadMeasures();
   const ctx = document.getElementById('measureChart');
   if (measureChartInstance) measureChartInstance.destroy();
   measureChartInstance = new Chart(ctx, {
@@ -916,18 +971,19 @@ function renderBody() {
   });
   const wrap = document.getElementById('measureList');
   if (!m.length) { wrap.innerHTML = '<div class="empty-state">No measurements logged yet.</div>'; return; }
-  wrap.innerHTML = [...m].reverse().map((x, revIdx) => {
-    const idx = m.length - 1 - revIdx;
-    return `<div class="exrow"><div style="flex:1">${escapeHtml(x.date)} — ${x.weight ?? '—'}${x.bodyFat!=null ? ' · '+x.bodyFat+'%':''}</div><button class="del" data-mdel="${idx}">×</button></div>`;
+  wrap.innerHTML = [...m].reverse().map((x) => {
+    return `<div class="exrow"><div style="flex:1">${escapeHtml(x.date)} — ${x.weight ?? '—'}${x.bodyFat!=null ? ' · '+x.bodyFat+'%':''}</div><button class="del" data-mdel="${x.id}">×</button></div>`;
   }).join('');
-  wrap.querySelectorAll('[data-mdel]').forEach(btn => btn.addEventListener('click', () => {
-    const mm = loadMeasures(); mm.splice(Number(btn.dataset.mdel), 1); saveMeasures(mm); renderBody();
+  wrap.querySelectorAll('[data-mdel]').forEach(btn => btn.addEventListener('click', async () => {
+    await deleteMeasure(btn.dataset.mdel);
+    await renderBody();
   }));
 }
 
 /* =========================================================================
    INIT
    ========================================================================= */
+showConfigWarningIfNeeded();
 renderDashboard();
 </script>
 </body>
